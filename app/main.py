@@ -1,34 +1,15 @@
-import os
 import logging
-import psycopg2
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+from app.db import get_db_connection
+from app.services.embedding import generate_embedding, get_gemini_key
+from app.services.retrieval import insert_document, search_similar_documents
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="RAG Example API with Gemini")
 
-# -------------------------------
-# Gemini API ayarları
-# -------------------------------
-GEMINI_API_URL = "https://gemini.googleapis.com/v1/embeddings"
-
-def get_gemini_key():
-    # Secret manager veya env dosyası kullan
-    return os.getenv("GEMINI_API_KEY")
-
-# -------------------------------
-# DB Bağlantısı
-# -------------------------------
-def get_db_connection():
-    return psycopg2.connect(
-        dbname=os.getenv("POSTGRES_DB"),
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        host=os.getenv("POSTGRES_HOST"),
-        port=os.getenv("POSTGRES_PORT"),
-    )
 
 # -------------------------------
 # Startup event: DB kontrol
@@ -60,36 +41,8 @@ class DocumentRequest(BaseModel):
 def add_document(request: DocumentRequest):
     content = request.content
     try:
-        # ✅ Doğru Embedding Model + Endpoint (embedContent)
-        EMBED_URL = (
-            f"https://generativelanguage.googleapis.com/v1beta/"
-            f"models/gemini-embedding-001:embedContent?key={get_gemini_key()}"
-        )
-
-        payload = {
-            "content": {
-                "parts": [{"text": content}]
-            },
-            "outputDimensionality": 3072
-        }
-
-        resp = requests.post(EMBED_URL, json=payload, timeout=30)
-        if resp.status_code != 200:
-            raise Exception(f"Gemini error: {resp.text}")
-
-        # ✅ Doğru response yolu
-        embedding_vector = resp.json()["embedding"]["values"]
-
-        # DB insert
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO documents (content, embedding) VALUES (%s, %s)",
-            (content, embedding_vector)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        embedding_vector = generate_embedding(content)
+        insert_document(content, embedding_vector)
 
         return {"status": "success", "content": content}
 
@@ -110,63 +63,14 @@ def similarity_search(request: SearchRequest):
     try:
         query_text = request.query
         top_k = request.top_k
+        query_vector = generate_embedding(query_text)
+        results = search_similar_documents(query_vector, top_k)
 
-        # 1️⃣ Query embedding üret
-        EMBED_URL = (
-            f"https://generativelanguage.googleapis.com/v1beta/"
-            f"models/gemini-embedding-001:embedContent?key={get_gemini_key()}"
-        )
-
-        payload = {
-            "content": {
-                "parts": [{"text": query_text}]
-            },
-            "outputDimensionality": 3072
-        }
-
-        resp = requests.post(EMBED_URL, json=payload, timeout=30)
-        if resp.status_code != 200:
-            raise Exception(f"Gemini error: {resp.text}")
-
-        query_vector = resp.json()["embedding"]["values"]
-
-        # psycopg2 list -> numeric[] olarak gider; <=> operatörü vector beklediği için
-        # pgvector literal formatına çeviriyoruz: "[0.1,0.2,...]"
-        query_vector_str = "[" + ",".join(str(float(x)) for x in query_vector) + "]"
-
-        # 2️⃣ Cosine similarity ile arama
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT id, content, embedding <=> (%s::vector) AS distance
-            FROM documents
-            ORDER BY embedding <=> (%s::vector)
-            LIMIT %s;
-            """,
-            (query_vector_str, query_vector_str, top_k)
-        )
-
-        results = cur.fetchall()
-
-        cur.close()
-        conn.close()
-
-        return {
-            "query": query_text,
-            "results": [
-                {
-                    "id": row[0],
-                    "content": row[1],
-                    "cosine_distance": float(row[2])
-                }
-                for row in results
-            ]
-        }
-
+        return {"query": query_text, "results": results}
+       
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
 
 @app.get("/gemini-test")
 def gemini_test(prompt: str = Query(..., description="Test prompt for Gemini")):
