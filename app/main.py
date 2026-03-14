@@ -42,7 +42,13 @@ def add_document(request: DocumentRequest):
     content = request.content
     try:
         embedding_vector = generate_embedding(content)
-        insert_document(content, embedding_vector)
+        insert_document(
+            content=content,
+            embedding_vector=embedding_vector,
+            source_name="manual",
+            section_title="manual_insert",
+            chunk_index=0,
+)
 
         return {"status": "success", "content": content}
 
